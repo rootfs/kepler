@@ -158,6 +158,27 @@ struct {
 	__uint(max_entries, NUM_CPUS);
 } cache_miss SEC(".maps");
 
+struct {
+    __uint(type, BPF_MAP_TYPE_ARRAY);
+    __type(key, u32);
+    __type(value, u64);
+    __uint(max_entries, 1);
+} total_events SEC(".maps");
+
+struct {
+    __uint(type, BPF_MAP_TYPE_ARRAY);
+    __type(key, u32);
+    __type(value, u64);
+    __uint(max_entries, 1);
+} sampled_events SEC(".maps");
+
+struct {
+    __uint(type, BPF_MAP_TYPE_HASH);
+    __type(key, u32);
+    __type(value, u64);
+    __uint(max_entries, MAP_SIZE);
+} total_cpu_time SEC(".maps");
+
 // Test mode skips unsupported helpers
 SEC(".rodata.config")
 __attribute__((btf_decl_tag("Test"))) static volatile const int TEST = 0;
@@ -307,59 +328,82 @@ static inline void do_page_cache_hit_increment(u32 curr_pid)
 }
 
 static inline int do_kepler_sched_switch_trace(
-	u32 prev_pid, u32 next_pid, u32 prev_tgid, u32 next_tgid)
+    u32 prev_pid, u32 next_pid, u32 prev_tgid, u32 next_tgid)
 {
-	u32 cpu_id;
-	u64 curr_ts = bpf_ktime_get_ns();
+    u32 cpu_id;
+    u64 curr_ts = bpf_ktime_get_ns();
+    u32 key = 0;
+    u64 *total_count, *sample_count, *prev_cpu_time;
+    
+    struct process_metrics_t *curr_tgid_metrics, *prev_tgid_metrics;
+    struct process_metrics_t buf = {};
 
-	struct process_metrics_t *curr_tgid_metrics, *prev_tgid_metrics;
-	struct process_metrics_t buf = {};
+    cpu_id = bpf_get_smp_processor_id();
 
-	cpu_id = bpf_get_smp_processor_id();
+    // Increment total events counter
+    total_count = bpf_map_lookup_elem(&total_events, &key);
+    if (total_count) {
+        __sync_fetch_and_add(total_count, 1);
+    }
 
-	// Skip some samples to minimize overhead
-	if (SAMPLE_RATE > 0) {
-		if (counter_sched_switch > 0) {
-			// update hardware counters to be used when sample is taken
-			if (counter_sched_switch == 1) {
-				collect_metrics_and_reset_counters(
-					&buf, prev_pid, curr_ts, cpu_id);
-				// Add task on-cpu running start time
-				bpf_map_update_elem(
-					&pid_time_map, &next_pid, &curr_ts,
-					BPF_ANY);
-				// create new process metrics
-				register_new_process_if_not_exist(next_tgid);
-			}
-			counter_sched_switch--;
-			return 0;
-		}
-		counter_sched_switch = SAMPLE_RATE;
-	}
+    // Skip some samples to minimize overhead
+    if (SAMPLE_RATE > 0) {
+        if (counter_sched_switch > 0) {
+            // update hardware counters to be used when sample is taken
+            if (counter_sched_switch == 1) {
+                collect_metrics_and_reset_counters(
+                    &buf, prev_pid, curr_ts, cpu_id);
+                // Add task on-cpu running start time
+                bpf_map_update_elem(
+                    &pid_time_map, &next_pid, &curr_ts,
+                    BPF_ANY);
+                // create new process metrics
+                register_new_process_if_not_exist(next_tgid);
+            }
+            counter_sched_switch--;
+            return 0;
+        }
+        counter_sched_switch = SAMPLE_RATE;
+    }
 
-	collect_metrics_and_reset_counters(&buf, prev_pid, curr_ts, cpu_id);
+    // Increment sampled events counter
+    sample_count = bpf_map_lookup_elem(&sampled_events, &key);
+    if (sample_count) {
+        __sync_fetch_and_add(sample_count, 1);
+    }
 
-	// The process_run_time is 0 if we do not have the previous timestamp of
-	// the task or due to a clock issue. In either case, we skip collecting
-	// all metrics to avoid discrepancies between the hardware counter and CPU
-	// time.
-	if (buf.process_run_time > 0) {
-		prev_tgid_metrics = bpf_map_lookup_elem(&processes, &prev_tgid);
-		if (prev_tgid_metrics) {
-			prev_tgid_metrics->process_run_time += buf.process_run_time;
-			prev_tgid_metrics->cpu_cycles += buf.cpu_cycles;
-			prev_tgid_metrics->cpu_instr += buf.cpu_instr;
-			prev_tgid_metrics->cache_miss += buf.cache_miss;
-		}
-	}
+    collect_metrics_and_reset_counters(&buf, prev_pid, curr_ts, cpu_id);
 
-	// Add task on-cpu running start time
-	bpf_map_update_elem(&pid_time_map, &next_pid, &curr_ts, BPF_ANY);
+    // The process_run_time is 0 if we do not have the previous timestamp of
+    // the task or due to a clock issue. In either case, we skip collecting
+    // all metrics to avoid discrepancies between the hardware counter and CPU
+    // time.
+    if (buf.process_run_time > 0) {
+        prev_tgid_metrics = bpf_map_lookup_elem(&processes, &prev_tgid);
+        if (prev_tgid_metrics) {
+            prev_tgid_metrics->process_run_time += buf.process_run_time;
+            prev_tgid_metrics->cpu_cycles += buf.cpu_cycles;
+            prev_tgid_metrics->cpu_instr += buf.cpu_instr;
+            prev_tgid_metrics->cache_miss += buf.cache_miss;
+            
+            // Update total CPU time for the process
+            prev_cpu_time = bpf_map_lookup_elem(&total_cpu_time, &prev_tgid);
+            if (prev_cpu_time) {
+                *prev_cpu_time += buf.process_run_time;
+            } else {
+                u64 init_time = buf.process_run_time;
+                bpf_map_update_elem(&total_cpu_time, &prev_tgid, &init_time, BPF_ANY);
+            }
+        }
+    }
 
-	// create new process metrics
-	register_new_process_if_not_exist(prev_tgid);
+    // Add task on-cpu running start time
+    bpf_map_update_elem(&pid_time_map, &next_pid, &curr_ts, BPF_ANY);
 
-	return 0;
+    // create new process metrics
+    register_new_process_if_not_exist(prev_tgid);
+
+    return 0;
 }
 
 static __always_inline void *

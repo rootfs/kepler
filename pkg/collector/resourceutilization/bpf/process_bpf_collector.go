@@ -83,9 +83,10 @@ func updateHWCounters(key uint64, ct *ProcessBPFMetrics, processStats map[uint64
 func UpdateProcessBPFMetrics(bpfExporter bpf.Exporter, processStats map[uint64]*stats.ProcessStats) {
 	processesData, err := bpfExporter.CollectProcesses()
 	if err != nil {
-		klog.Errorln("could not collect ebpf metrics")
+		klog.Errorf("could not collect ebpf metrics: %v", err)
 		return
 	}
+	count := 0
 	for _, ct := range processesData {
 		comm := C.GoString((*C.char)(unsafe.Pointer(&ct.Comm)))
 
@@ -103,7 +104,7 @@ func UpdateProcessBPFMetrics(bpfExporter bpf.Exporter, processStats map[uint64]*
 		if err != nil {
 			klog.V(6).Infof("failed to resolve container for PID %v (command=%s): %v, set containerID=%s", ct.Pid, comm, err, utils.SystemProcessName)
 		}
-
+		count += 1
 		// if the pid is within a VM, it will have an VM ID
 		vmID := utils.EmptyString
 		if config.IsExposeVMStatsEnabled() {
@@ -135,4 +136,6 @@ func UpdateProcessBPFMetrics(bpfExporter bpf.Exporter, processStats map[uint64]*
 		updateSWCounters(mapKey, &ct, processStats, bpfSupportedMetrics)
 		updateHWCounters(mapKey, &ct, processStats, bpfSupportedMetrics)
 	}
+	// print the number of processes
+	klog.V(1).Infof("number of processes: %d", count)
 }

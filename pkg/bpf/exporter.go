@@ -17,7 +17,6 @@ limitations under the License.
 package bpf
 
 import (
-	"errors"
 	"fmt"
 	"os"
 	"runtime"
@@ -199,14 +198,79 @@ func (e *exporter) Detach() {
 	e.bpfObjects.Close()
 }
 
+// Add these new structs to represent the new map data
+type ExtrapolationData struct {
+	TotalEvents   uint64
+	SampledEvents uint64
+	TotalCPUTime  map[uint32]uint64
+}
+
+func (e *exporter) CollectExtrapolationData() (*ExtrapolationData, error) {
+	data := &ExtrapolationData{
+		TotalCPUTime: make(map[uint32]uint64),
+	}
+
+	// Read and reset total_events
+	var totalEvents uint64
+	err := e.bpfObjects.TotalEvents.Lookup(uint32(0), &totalEvents)
+	if err != nil {
+		return nil, fmt.Errorf("failed to read total_events: %v", err)
+	}
+	data.TotalEvents = totalEvents
+
+	// Reset total_events to 0
+	err = e.bpfObjects.TotalEvents.Update(uint32(0), uint64(0), ebpf.UpdateAny)
+	if err != nil {
+		return nil, fmt.Errorf("failed to reset total_events: %v", err)
+	}
+
+	// Read and reset sampled_events
+	var sampledEvents uint64
+	err = e.bpfObjects.SampledEvents.Lookup(uint32(0), &sampledEvents)
+	if err != nil {
+		return nil, fmt.Errorf("failed to read sampled_events: %v", err)
+	}
+	data.SampledEvents = sampledEvents
+
+	// Reset sampled_events to 0
+	err = e.bpfObjects.SampledEvents.Update(uint32(0), uint64(0), ebpf.UpdateAny)
+	if err != nil {
+		return nil, fmt.Errorf("failed to reset sampled_events: %v", err)
+	}
+
+	// Read total_cpu_time and then clear it
+	var key uint32
+	var value uint64
+	iterator := e.bpfObjects.TotalCpuTime.Iterate()
+	for iterator.Next(&key, &value) {
+		data.TotalCPUTime[key] = value
+		// Delete each entry after reading it
+		err := e.bpfObjects.TotalCpuTime.Delete(key)
+		if err != nil {
+			return nil, fmt.Errorf("error deleting entry from total_cpu_time: %v", err)
+		}
+	}
+	if iterator.Err() != nil {
+		return nil, fmt.Errorf("error iterating total_cpu_time: %v", iterator.Err())
+	}
+	klog.Infof("Collected extrapolation data: total_events=%d, sampled_events=%d, total_cpu_time=%v", data.TotalEvents, data.SampledEvents, data.TotalCPUTime)
+	return data, nil
+}
+
 func (e *exporter) CollectProcesses() ([]ProcessMetrics, error) {
 	start := time.Now()
-	// Get the max number of entries in the map
 	maxEntries := e.bpfObjects.Processes.MaxEntries()
 	total := 0
 	deleteKeys := make([]uint32, maxEntries)
 	deleteValues := make([]ProcessMetrics, maxEntries)
 	var cursor ebpf.MapBatchCursor
+	// Collect extrapolation data
+	extrapolationData, err := e.CollectExtrapolationData()
+	if err != nil {
+		klog.Errorf("failed to collect extrapolation data: %v", err)
+		return nil, fmt.Errorf("failed to collect extrapolation data: %v", err)
+	}
+
 	for {
 		count, err := e.bpfObjects.Processes.BatchLookupAndDelete(
 			&cursor,
@@ -215,14 +279,33 @@ func (e *exporter) CollectProcesses() ([]ProcessMetrics, error) {
 			&ebpf.BatchOptions{},
 		)
 		total += count
-		if errors.Is(err, ebpf.ErrKeyNotExist) {
+		if err != nil {
 			break
 		}
-		if err != nil {
-			return nil, fmt.Errorf("failed to batch lookup and delete: %v", err)
+	}
+
+	// Calculate the global extrapolation factor
+	extrapolationFactor := float64(extrapolationData.TotalEvents) / float64(extrapolationData.SampledEvents)
+
+	// Extrapolate CPU time for each process
+	for i := 0; i < total; i++ {
+		pid := deleteValues[i].Pid
+		sampledCPUTime := deleteValues[i].ProcessRunTime
+		if totalCPUTime, ok := extrapolationData.TotalCPUTime[uint32(pid)]; ok {
+			// Use both sampled CPU time and total CPU time for extrapolation
+			sampledFraction := float64(sampledCPUTime) / float64(totalCPUTime)
+			extrapolatedCPUTime := uint64(float64(totalCPUTime) * extrapolationFactor * sampledFraction)
+			deleteValues[i].ProcessRunTime = extrapolatedCPUTime
+			klog.Infof("Extrapolated CPU time for PID %d (sampled fraction %v factor %v): %v/%v -> %v", pid, sampledFraction, extrapolationFactor, sampledCPUTime, totalCPUTime, extrapolatedCPUTime)
+		} else {
+			// If we don't have total CPU time data, use the global extrapolation factor
+			extrapolatedCPUTime := uint64(float64(sampledCPUTime) * extrapolationFactor)
+			deleteValues[i].ProcessRunTime = extrapolatedCPUTime
+			//klog.Warningf("No total CPU time data for PID %d, using global extrapolation: %v/%v", pid, extrapolatedCPUTime, sampledCPUTime)
 		}
 	}
-	klog.V(5).Infof("collected %d process samples in %v", total, time.Since(start))
+
+	klog.V(5).Infof("collected and extrapolated %d process samples in %v", total, time.Since(start))
 	return deleteValues[:total], nil
 }
 
